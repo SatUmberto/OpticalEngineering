@@ -1,0 +1,159 @@
+# Plan: Importing Forbes Q-type (Q-con / Q-bfs) aspheres into Optiland
+
+## Context
+
+`ASL1210.ipynb` loads Thorlabs' `ASL1210-Zemax-ZMX.zmx` with `load_zemax_file`. The lens surface is stored as Zemax `TYPE QED_TYPE` (OpticStudio's "Q-Type Asphere"), with its data in `XDAT` extra-data rows:
+
+```
+CURV 0.21666420  CONI -0.61524802
+XDAT 1 0        <- mode
+XDAT 2 5        <- number of terms
+XDAT 3 7.35     <- normalization radius (mm)
+XDAT 4..8       <- a0..a4 = 0.4763, -0.30334, 0.1119, -0.029, 0.0035
+```
+
+Optiland 0.6.3 (installed at `.venv/Lib/site-packages/optiland`) cannot import this file:
+- `fileio/zemax/reader/parser.py::_read_surf_type` has no `QED_TYPE` entry, so the surface type becomes `"qed_type"`.
+- `XDAT` is not in `_operand_table`, so the coefficients are silently dropped.
+- `fileio/zemax/reader/converter.py::_configure_surface_coefficients` then raises `ValueError("Unsupported Zemax surface type: qed_type")`.
+
+### Key finding: this specific lens is Q-bfs, not Q-con (verified numerically)
+
+I ray-traced the lens on its own (NumPy plus Optiland's `clenshaw_qbfs`) under each candidate interpretation of the data. The table shows best-focus RMS spot radius at λ = 0.78 µm, NA about 0.6:
+
+| Interpretation | RMS spot |
+|---|---|
+| Conic only (no polynomial) | 41 µm |
+| **Q-con**, z = conic + u⁴ Σ aₘ Pₘ^(0,4)(2u²−1) | 203 µm (worse) |
+| **Q-bfs on a conic base, with the φ projection factor** | **1.7 µm** |
+
+At the file's primary wavelength (0.405 µm), the Q-bfs reading gives **back focal distance 4.8984 mm vs the file's DISZ of 4.8989 mm**, with 0.04 µm RMS. Two conclusions follow:
+- `XDAT 1 = 0` means Q-bfs mode (some sources call Q-bfs "Type 0").
+- Optiland's existing `ForbesQNormalSlopeGeometry` (`geometries/forbes/geometry.py:278`) already implements exactly this sag, including the conic and the φ factor.
+
+**Consequence:** importing this lens needs only Zemax reader plumbing (Phase 1). Q-con math (Phase 2) is still worth adding for other vendors' files, which use `XDAT 1 = 1`, but your ASL1210 doesn't need it.
+
+**Where to implement:** in a fork or clone of the Optiland repo (`pip install -e`) with a PR upstream, not by editing `.venv/site-packages`.
+
+---
+
+## Phase 1: Import `QED_TYPE` from Zemax (fixes the ASL1210 lens)
+
+1. **Parser** (`fileio/zemax/reader/parser.py`)
+   - Add `"XDAT": self._read_extra_data` to `_operand_table`. Store each row as `xdat_{i-1}` (0-based, mirroring `_read_surface_parameter`/`param_{n}`).
+   - Map `"QED_TYPE": "qtype_asphere"` in `_read_surf_type` (an intermediate tag that is resolved to a real type in the converter).
+2. **Converter** (`fileio/zemax/reader/converter.py`)
+   - Add a helper `_resolve_qtype(surf) -> dict`:
+     - `mode = int(xdat_0)` and `n = int(xdat_1)`.
+     - `norm_radius = xdat_2`.
+     - `radial_terms = {m: xdat_{3+m} for m in range(n)}`, with integer keys.
+     - Mode 0 → `surface_type="forbes_qbfs"`. Mode 1 → `"forbes_qcon"` (Phase 2); until Phase 2 lands, raise a clear `NotImplementedError` for mode 1.
+     - Any other mode value raises a `ValueError`.
+   - Call the helper in **both** `_configure_surface` and `_add_surface_with_current_cs`, because there are two code paths (with and without coordinate breaks).
+   - Pass `radial_terms` and `norm_radius` as kwargs. `GeometryFactory.create` already filters kwargs by config fields, so the `coefficients` kwarg is ignored harmlessly.
+   - Return `None` for the new type in `_configure_surface_coefficients`, so it no longer raises.
+   - Always pass `norm_radius` explicitly. This puts the geometry in `"manual"` normalization mode. Otherwise `update_normalization` would overwrite it with 1.25 × semi-aperture and silently invalidate the coefficients.
+3. **Writer round-trip** (`fileio/zemax/surfaces.py`): register a `QTypeAsphereSurfaceHandler` (`zemax_type="QED_TYPE"`, `optiland_type="forbes_qbfs"`) whose `format()` emits `XDAT` rows. Check how `writer/formatter.py:277` serializes extra data; it may need an XDAT emitter, since only `PARM` may exist today.
+4. **Fix the JSON round-trip bug (pre-existing, confirmed):**
+   - `ForbesQNormalSlopeGeometry.from_dict` receives string keys after `json.dumps`/`loads`, and `_prepare_coeffs` then fails with `TypeError: '>=' not supported between 'str' and 'int'`.
+   - So `save_optiland_file` → `load_optiland_file` of any Q-bfs surface breaks today.
+   - Fix: cast keys with `int(k)` in `from_dict` (and in `__init__` for robustness).
+
+## Phase 1b: Fix paraxial optics for Q-bfs surfaces (pre-existing bug, confirmed)
+
+Q-bfs's u²(1−u²) prefactor adds an r² term, which changes the vertex curvature. Optiland's paraxial engine only uses `geometry.radius` (`interactions/refractive_reflective_model.py:68,73`).
+
+Measured on this lens: the paraxial BFL is identical with and without the Q terms (4.725 mm), while the true focus is 4.898 mm. This affects:
+- `optic.paraxial.f2()`, EFL and F/#
+- `image_solve`
+- paraxial-ray-based semi-apertures
+- field and aperture conversions
+
+Real-ray analyses (spot diagrams, `QuickFocusSolve`) are not affected.
+
+**Fix:**
+- Add an overridable `paraxial_radius` property on `BaseGeometry` (default: `self.radius`).
+- `ForbesQNormalSlopeGeometry` overrides it with c_eff = c + 2·S(0)/r_n², where S(0) = `clenshaw_qbfs(coeffs, 0)` and φ(0) = 1.
+- Use it in `refractive_reflective_model.py` (both lines) and in any other paraxial consumers (grep for `geometry.radius` under `paraxial*`, `optic/`, `solves/`).
+- Q-con needs no override, because its leading term is u⁴.
+
+## Phase 2: Add a Q-con geometry (`forbes_qcon`)
+
+**Math** (Forbes 2007):
+- u = r/r_n and t = 2u² − 1
+- z = z_conic(r) + u⁴ · S(t), with S(t) = Σ aₘ Pₘ^(0,4)(t)
+- dz/dr = z_conic′ + (1/r_n)·[4u³·S + 4u⁵·S′(t)]
+- There is no φ factor, because Q-con is a sag (z-axis) departure.
+
+**Reuse:**
+- `geometries/forbes/jacobi.py`: `jacobi_sum_clenshaw(s, 0, 4, t)` (the sum is `alphas[0]`) and `jacobi_sum_clenshaw_der(..., j=1)`. I checked `recurrence_abc(0,0,4)`, which gives P₁ = 3t − 2, correct.
+- `ForbesGeometryBase` (`geometry.py:151`): `_base_sag`, `_base_sag_derivative`, the coefficient cache and `_ensure_coeffs`.
+
+**Steps:**
+1. `geometries/forbes/qpoly.py`: add `clenshaw_qcon(coeffs, usq)` and `compute_z_zprime_qcon(coeffs, u, usq)`. Add a **functional (no in-place) torch path**, as `_clenshaw_qbfs_functional` does, because `jacobi_sum_clenshaw` writes in place into a preallocated tensor and would break autograd.
+2. `geometries/forbes/geometry.py`:
+   - Extract the radial-coefficient plumbing currently in `ForbesQNormalSlopeGeometry` into a private `_ForbesRadialGeometry(ForbesGeometryBase)` intermediate class: the `__init__` handling of `radial_terms` and `norm_radius`, `_prepare_coeffs`, `to_dict`, `scale` and `update_normalization`.
+   - Make `ForbesQNormalSlopeGeometry` and the new `ForbesQconGeometry` both inherit from it.
+   - Don't subclass Q-bfs directly: `isinstance(geom, ForbesQNormalSlopeGeometry)` checks (for example `optimization/variable/forbes_coeff.py:57`) must not accept Q-con. Also, `from_dict` is hard-coded to return `ForbesQNormalSlopeGeometry` and must be per-class.
+   - `ForbesQconGeometry` implements `sag`, `_surface_normal`, `_surface_normal_analytical`, `from_dict` and `__str__ = "ForbesQcon"`.
+3. **Registration** (follow the `forbes_qbfs` pattern everywhere):
+   - `surfaces/factories/geometry_configs.py`: `ForbesQconConfig` (`surface_type="forbes_qcon"`, `radius`, `conic`, `radial_terms`, `norm_radius`, `tol`, `max_iter`).
+   - `surfaces/factories/geometry_factory.py`: `_create_forbes_qcon`, plus an entry in `geometry_mapper`.
+   - `_types.py`: add `"forbes_qcon"` to `SurfaceType`.
+   - `optic/optic_updater.py:285`: add `"forbes_qcon"` to the list that triggers `update_paraxial`.
+   - Export from `geometries/forbes/__init__.py` and `geometries/__init__.py`.
+   - `optimization/variable/variable.py:140` and `forbes_coeff.py`: add `"forbes_qcon_coeff"`. Simplest: let `ForbesQNormalSlopeCoeffVariable` accept either class through a tuple `isinstance` check.
+4. Wire Zemax mode 1 → `forbes_qcon` in the Phase 1 converter helper, and in the writer handler (choose the mode from the geometry class).
+5. Optionally, add CODE V support (`fileio/codev/surfaces.py`, the `QCN`/`QBF` surface types) using the same pattern; that can be a separate PR.
+
+---
+
+## Risks and likely bug sites
+
+| # | Risk | Likelihood / impact | Mitigation |
+|---|---|---|---|
+| 1 | **Wrong XDAT layout or mode interpretation.** The OpticStudio docs aren't publicly fetchable, so the layout is inferred. Mode 0 = Q-bfs is confirmed numerically by this file. **Mode 1 = Q-con is unverified.** | High / silent wrong optics | Get one known Q-con `.zmx` (or create one in OpticStudio with a known sag table) and add a regression test against Zemax sag values. Raise an error on unknown modes and on XDAT counts that don't match `n`. |
+| 2 | **Silent auto-normalization.** If `norm_radius` isn't passed, `update_normalization` resets r_n to 1.25 × semi-aperture, and the coefficients become meaningless while no error is shown. | High if missed / severe | Always pass `norm_radius` (manual mode), and add a test asserting `normalization_mode == "manual"` after import. |
+| 3 | **Paraxial curvature ignores the Q-bfs u² term** (confirmed: EFL and BFL off by about 0.17 mm on this lens). | Certain today / medium (wrong EFL, wrong `image_solve`) | Phase 1b. Test: paraxial BFL ≈ real-ray best focus (4.898 mm at 0.405 µm). |
+| 4 | **JSON round-trip breaks** because keys become strings (confirmed). | Certain today / save/load crash | `int()` the keys in `from_dict`, and add a round-trip test. |
+| 5 | **Clamping outside u > 1.** The Q-bfs `sag` uses `be.where(usq > 1, 0, departure)`, which creates a sag discontinuity if the aperture is larger than r_n. It's harmless here (r_n = 7.35 > 6.25), but other files may differ. Zemax's behavior there is unknown. | Medium / ray-trace artifacts at the edge | For Q-con, don't clamp. For both types, warn on import when the clear aperture is larger than r_n. |
+| 6 | **Torch autograd.** The Jacobi Clenshaw functions assign in place, so gradients will be broken or raise errors under the torch backend. | Medium / only during torch optimization | Add a functional implementation, and test that gradients match finite differences. |
+| 7 | **Latent bug in `jacobi_sum_clenshaw_der`**: it uses `j * a` where `jj * a` is expected. Harmless for j = 1, wrong for second derivatives. | Low | Fix it in passing and add a j = 2 test. |
+| 8 | **Precision of high-order terms.** The recursion is stable, but r_n mismatch or float32 (torch) can cost accuracy for M > 10. | Low | Use float64 in the tests, and compare against `scipy.special.eval_jacobi`. |
+| 9 | **Refactoring Q-bfs into a shared base** could break serialization of the legacy `ForbesQbfsGeometry` alias or the optimizer `isinstance` checks. | Low–medium | Keep class names and `to_dict` format unchanged, and run the existing Forbes test suite. |
+| 10 | **Two converter code paths** (with and without coordinate breaks): if only one is updated, the import works for some files and fails for others. | Medium | Put the shared logic in one helper, and test both paths. |
+
+Overall: **Phase 1 + 1b are low-risk** (mostly plumbing, and the math already exists and was validated). **Phase 2 is medium-risk**, mainly because of risk 1 (the Q-con mode convention) and risk 6 (torch).
+
+---
+
+## Verification
+
+1. **Unit tests**, in the upstream repo's `tests/` alongside the existing Forbes tests:
+   - Q-con sag and slope vs. a direct `scipy.special.eval_jacobi` evaluation, and normals vs. finite differences.
+   - Q-bfs `from_dict(json.loads(json.dumps(to_dict())))` round-trip.
+   - Paraxial radius of a Q-bfs surface vs. a numerical second derivative of its sag at r → 0.
+   - Torch backend: gradient of sag with respect to the coefficients vs. finite differences.
+2. **Import test using ASL1210** (copy the `.zmx` into the test fixtures):
+   - `load_zemax_file` succeeds, and surface 1 is a `ForbesQNormalSlopeGeometry` with r_n = 7.35, 5 terms and manual normalization.
+   - At 0.405 µm with the file's 4.8989 mm image distance, the on-axis RMS spot is below 1 µm (expected about 0.04 µm). Conic-only gives about 40 µm, so this cleanly detects a wrong import.
+   - The paraxial BFL is within 0.01 mm of 4.899 (after Phase 1b).
+   - Zemax export → re-import gives an identical sag.
+3. **End-to-end:** re-run `ASL1210.ipynb` against the editable install. The spot diagram should be near diffraction-limited before the user's wavelength change. After switching to 1.55 µm, `QuickFocusSolve` should refocus.
+
+## Immediate workaround (no Optiland changes)
+
+Build surface 1 by hand in the notebook:
+
+```python
+surfaces.add(
+    surface_type="forbes_qbfs",
+    radius=1/0.2166642042044240,
+    conic=-0.61524802449265037,
+    norm_radius=7.35,
+    radial_terms={0: 0.4763, 1: -0.30334, 2: 0.1119, 3: -0.029, 4: 0.0035},
+    ...,
+)
+```
+
+Use real-ray focusing (`QuickFocusSolve`) rather than paraxial EFL until Phase 1b is fixed.
